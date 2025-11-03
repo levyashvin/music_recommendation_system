@@ -33,7 +33,7 @@ def load_df(csv_path, id_col, title_col, artist_col, lyrics_col, limit_rows=None
 def build(csv_path, out_dir, id_col, title_col, artist_col, lyrics_col,
           model_name="sentence-transformers/all-MiniLM-L6-v2",
           ngram_low=1, ngram_high=1, max_df=0.6, min_df=10, max_features=100_000,
-          batch_size=64, max_words=350, device="auto", tfidf="on", songs_per_batch=1024,
+          batch_size=64, max_words=350, device="auto",
           # HNSW params (if used)
           ef_construction=200, M=64, ef=256,
           # Annoy params (if used)
@@ -42,28 +42,26 @@ def build(csv_path, out_dir, id_col, title_col, artist_col, lyrics_col,
     os.makedirs(out_dir, exist_ok=True)
     df = load_df(csv_path, id_col, title_col, artist_col, lyrics_col, limit_rows=limit_rows)
 
-    # TF-IDF (optional, can be memory-heavy)
-    X = None
-    if str(tfidf).lower() in ("on", "true", "1", "yes"):
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from scipy.sparse import save_npz
-        import joblib
+    # TF-IDF
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from scipy.sparse import save_npz
+    import joblib
 
-        vec = TfidfVectorizer(
-            lowercase=True,
-            stop_words="english",
-            ngram_range=(ngram_low, ngram_high),
-            max_df=max_df,
-            min_df=min_df,
-            max_features=max_features,
-            strip_accents="unicode",
-            sublinear_tf=True,
-            norm="l2",
-            dtype=np.float32,
-        )
-        X = vec.fit_transform(df[lyrics_col])
-        joblib.dump(vec, os.path.join(out_dir, "tfidf_vectorizer.joblib"))
-        save_npz(os.path.join(out_dir, "tfidf_matrix.npz"), X)
+    vec = TfidfVectorizer(
+        lowercase=True,
+        stop_words="english",
+        ngram_range=(ngram_low, ngram_high),
+        max_df=max_df,
+        min_df=min_df,
+        max_features=max_features,
+        strip_accents="unicode",
+        sublinear_tf=True,
+        norm="l2",
+        dtype=np.float32,
+    )
+    X = vec.fit_transform(df[lyrics_col])
+    joblib.dump(vec, os.path.join(out_dir, "tfidf_vectorizer.joblib"))
+    save_npz(os.path.join(out_dir, "tfidf_matrix.npz"), X)
 
     # Embeddings (chunk long lyrics, mean-pool), then L2-normalize final vectors
     from sentence_transformers import SentenceTransformer
@@ -76,43 +74,24 @@ def build(csv_path, out_dir, id_col, title_col, artist_col, lyrics_col,
     except Exception:
         dev = "cpu"
     model = SentenceTransformer(model_name, device=dev)
-    # Streaming embedding build to keep RAM low
-    n_docs = len(df)
-    emb_path = os.path.join(out_dir, "embeddings.npy")
-    emb_mm = None
-    dim = None
+    all_chunks, doc_ptrs = [], []
+    for txt in df[lyrics_col].tolist():
+        ch = chunk_words(txt, max_words=max_words) or [txt]
+        s = len(all_chunks)
+        all_chunks.extend(ch)
+        e = len(all_chunks)
+        doc_ptrs.append((s, e))
 
-    def encode_texts(texts):
-        return model.encode(texts, batch_size=batch_size, convert_to_numpy=True, normalize_embeddings=True)
-
-    lyrics_list = df[lyrics_col].tolist()
-    for start in range(0, n_docs, int(songs_per_batch)):
-        end = min(n_docs, start + int(songs_per_batch))
-        batch_texts = []
-        ptrs = []
-        for t in lyrics_list[start:end]:
-            ch = chunk_words(t, max_words=max_words) or [t]
-            s = len(batch_texts)
-            batch_texts.extend(ch)
-            e = len(batch_texts)
-            ptrs.append((s, e))
-        if not batch_texts:
-            continue
-        chunk_emb = encode_texts(batch_texts)
-        if dim is None:
-            dim = int(chunk_emb.shape[1])
-            emb_mm = np.memmap(emb_path, dtype=np.float32, mode='w+', shape=(n_docs, dim))
-        for i, (s, e) in enumerate(ptrs):
-            vec = chunk_emb[s:e].mean(axis=0)
-            nrm = np.linalg.norm(vec)
-            if nrm > 1e-12:
-                vec = (vec / nrm).astype(np.float32)
-            else:
-                vec = vec.astype(np.float32)
-            emb_mm[start + i] = vec
-        del batch_texts, ptrs, chunk_emb
-    if emb_mm is not None:
-        del emb_mm
+    chunk_emb = model.encode(all_chunks, batch_size=batch_size, convert_to_numpy=True, normalize_embeddings=True)
+    dim = chunk_emb.shape[1]
+    emb = np.zeros((len(df), dim), dtype=np.float32)
+    for i, (s, e) in enumerate(doc_ptrs):
+        emb[i] = chunk_emb[s:e].mean(axis=0)
+    # Normalize pooled embeddings so dot = cosine for all backends
+    norms = np.linalg.norm(emb, axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-12, None)
+    emb = (emb / norms).astype(np.float32)
+    np.save(os.path.join(out_dir, "embeddings.npy"), emb)
 
     # Build ANN index depending on backend
     be = (index_backend or "annoy").lower()
@@ -152,22 +131,14 @@ def build(csv_path, out_dir, id_col, title_col, artist_col, lyrics_col,
     })
     lk.to_csv(os.path.join(out_dir, "lookup.csv"), index=False)
 
-    tfidf_info = f"TF-IDF={X.shape}" if X is not None else "TF-IDF=skipped"
-    # Read shape from saved embeddings
-    emb_shape = np.load(emb_path, mmap_mode='r').shape
-    print(f"Built: {tfidf_info}, Embeddings={emb_shape}, out={out_dir}")
+    print(f"Built: TF-IDF={X.shape}, Embeddings={emb.shape}, out={out_dir}")
 
 def load_runtime(out_dir, model_name=None, set_ef=256, index_backend="annoy", device="auto"):
     import joblib
     from scipy.sparse import load_npz
 
-    vec = None
-    X = None
-    vec_path = os.path.join(out_dir, "tfidf_vectorizer.joblib")
-    X_path = os.path.join(out_dir, "tfidf_matrix.npz")
-    if os.path.exists(vec_path) and os.path.exists(X_path):
-        vec = joblib.load(vec_path)
-        X = load_npz(X_path)
+    vec = joblib.load(os.path.join(out_dir, "tfidf_vectorizer.joblib"))
+    X = load_npz(os.path.join(out_dir, "tfidf_matrix.npz"))
     emb = np.load(os.path.join(out_dir, "embeddings.npy"))
     meta = pd.read_csv(os.path.join(out_dir, "meta.csv"))
     lk = pd.read_csv(os.path.join(out_dir, "lookup.csv"))
@@ -220,7 +191,7 @@ def _union_candidates_hybrid(cand_from_emb, q_emb_vec, X, q_tfidf_vec, emb, tfid
     # Start with ANN candidates
     cand = np.array(cand_from_emb, dtype=np.int64)
 
-    if X is not None and q_tfidf_vec is not None and tfidf_top and tfidf_top > 0:
+    if tfidf_top and tfidf_top > 0:
         # Full TF-IDF scan to collect top tfidf_top candidates
         scores_full = (X @ q_tfidf_vec.T).toarray().ravel()
         top = min(tfidf_top, scores_full.shape[0])
@@ -230,10 +201,7 @@ def _union_candidates_hybrid(cand_from_emb, q_emb_vec, X, q_tfidf_vec, emb, tfid
     # Exact cosine for embeddings (emb is L2 normalized)
     emb_sims = (emb[cand] @ q_emb_vec.ravel()).astype(np.float32)
     # TF-IDF sims for candidates only
-    if X is not None and q_tfidf_vec is not None:
-        tfidf_sims = (X[cand] @ q_tfidf_vec.T).toarray().ravel().astype(np.float32)
-    else:
-        tfidf_sims = np.zeros(cand.shape[0], dtype=np.float32)
+    tfidf_sims = (X[cand] @ q_tfidf_vec.T).toarray().ravel().astype(np.float32)
     return cand, emb_sims, tfidf_sims
 
 def hybrid_search_by_song(out_dir, k=10, candidates=1500, tfidf_top=0, alpha=0.6,
@@ -264,7 +232,7 @@ def hybrid_search_by_song(out_dir, k=10, candidates=1500, tfidf_top=0, alpha=0.6
         raise ValueError(f"Unsupported index backend: {index_backend}")
 
     q_emb_vec = emb[row:row+1]
-    q_tfidf_vec = X[row] if X is not None else None
+    q_tfidf_vec = X[row]
 
     cand, emb_sims, tfidf_sims = _union_candidates_hybrid(cand_emb, q_emb_vec, X, q_tfidf_vec, emb, tfidf_top=tfidf_top)
     # Exclude self if it slipped in via tfidf union
@@ -298,8 +266,8 @@ def hybrid_search_by_text(out_dir, query, k=10, candidates=1500, tfidf_top=0, al
     else:
         raise ValueError(f"Unsupported index backend: {index_backend}")
 
-    # TF-IDF query (optional)
-    q_tfidf = vec.transform([clean_lyrics(query)]) if vec is not None else None
+    # TF-IDF query
+    q_tfidf = vec.transform([clean_lyrics(query)])
 
     cand, emb_sims, tfidf_sims = _union_candidates_hybrid(cand_emb, q_emb, X, q_tfidf, emb, tfidf_top=tfidf_top)
     hybrid = alpha * emb_sims + (1.0 - alpha) * tfidf_sims
@@ -328,8 +296,6 @@ def main():
     spb.add_argument("--annoy-trees", type=int, default=50, help="Number of trees for Annoy index (higher=better recall, slower build)")
     spb.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Compute device for embeddings")
     spb.add_argument("--batch-size", type=int, default=64, help="Batch size for embedding computation")
-    spb.add_argument("--tfidf", choices=["on", "off"], default="on", help="Build TF-IDF artifacts (off reduces CPU RAM)")
-    spb.add_argument("--songs-per-batch", type=int, default=1024, help="Number of songs per embedding batch")
     spb.add_argument("--ngram-low", type=int, default=1, help="Min n-gram for TF-IDF")
     spb.add_argument("--ngram-high", type=int, default=1, help="Max n-gram for TF-IDF")
     spb.add_argument("--max-df", type=float, default=0.6, help="Max document frequency for TF-IDF vocabulary")
@@ -363,8 +329,7 @@ def main():
               model_name=args.model,
               ngram_low=args.ngram_low, ngram_high=args.ngram_high, max_df=args.max_df,
               min_df=args.min_df, max_features=args.max_features,
-              batch_size=args.batch_size, max_words=args.max_words, device=args.device, tfidf=args.tfidf,
-              songs_per_batch=args.songs_per_batch,
+              batch_size=args.batch_size, max_words=args.max_words, device=args.device,
               limit_rows=args.limit_rows, index_backend=args.index_backend,
               annoy_trees=args.annoy_trees)
     elif args.cmd == "search":
