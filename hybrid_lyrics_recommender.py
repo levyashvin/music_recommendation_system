@@ -101,7 +101,8 @@ def build(csv_path, out_dir, id_col, title_col, artist_col, lyrics_col,
         chunk_emb = encode_texts(batch_texts)
         if dim is None:
             dim = int(chunk_emb.shape[1])
-            emb_mm = np.memmap(emb_path, dtype=np.float32, mode='w+', shape=(n_docs, dim))
+            from numpy.lib.format import open_memmap
+            emb_mm = open_memmap(emb_path, mode='w+', dtype=np.float32, shape=(n_docs, dim))
         for i, (s, e) in enumerate(ptrs):
             vec = chunk_emb[s:e].mean(axis=0)
             nrm = np.linalg.norm(vec)
@@ -112,6 +113,10 @@ def build(csv_path, out_dir, id_col, title_col, artist_col, lyrics_col,
             emb_mm[start + i] = vec
         del batch_texts, ptrs, chunk_emb
     if emb_mm is not None:
+        try:
+            emb_mm.flush()
+        except Exception:
+            pass
         del emb_mm
 
     # Build ANN index depending on backend
@@ -168,7 +173,7 @@ def load_runtime(out_dir, model_name=None, set_ef=256, index_backend="annoy", de
     if os.path.exists(vec_path) and os.path.exists(X_path):
         vec = joblib.load(vec_path)
         X = load_npz(X_path)
-    emb = np.load(os.path.join(out_dir, "embeddings.npy"))
+    emb = np.load(os.path.join(out_dir, "embeddings.npy"), mmap_mode='r')
     meta = pd.read_csv(os.path.join(out_dir, "meta.csv"))
     lk = pd.read_csv(os.path.join(out_dir, "lookup.csv"))
 
