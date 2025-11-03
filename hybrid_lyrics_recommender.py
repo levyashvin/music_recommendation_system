@@ -18,7 +18,8 @@ def chunk_words(text, max_words=220):
     return [" ".join(ws[i:i+max_words]) for i in range(0, len(ws), max_words)]
 
 def load_df(csv_path, id_col, title_col, artist_col, lyrics_col, limit_rows=None):
-    df = pd.read_csv(csv_path, nrows=limit_rows)
+    usecols = [id_col, title_col, artist_col, lyrics_col]
+    df = pd.read_csv(csv_path, nrows=limit_rows, usecols=usecols)
     for c in [id_col, title_col, artist_col, lyrics_col]:
         if c not in df.columns:
             raise ValueError(f"Missing column: {c}")
@@ -31,8 +32,8 @@ def load_df(csv_path, id_col, title_col, artist_col, lyrics_col, limit_rows=None
 
 def build(csv_path, out_dir, id_col, title_col, artist_col, lyrics_col,
           model_name="sentence-transformers/all-MiniLM-L6-v2",
-          ngram_low=1, ngram_high=2, max_df=0.6, min_df=5, max_features=200_000,
-          batch_size=64, max_words=220, device="auto",
+          ngram_low=1, ngram_high=1, max_df=0.6, min_df=10, max_features=100_000,
+          batch_size=64, max_words=350, device="auto",
           # HNSW params (if used)
           ef_construction=200, M=64, ef=256,
           # Annoy params (if used)
@@ -56,6 +57,7 @@ def build(csv_path, out_dir, id_col, title_col, artist_col, lyrics_col,
         strip_accents="unicode",
         sublinear_tf=True,
         norm="l2",
+        dtype=np.float32,
     )
     X = vec.fit_transform(df[lyrics_col])
     joblib.dump(vec, os.path.join(out_dir, "tfidf_vectorizer.joblib"))
@@ -294,6 +296,12 @@ def main():
     spb.add_argument("--annoy-trees", type=int, default=50, help="Number of trees for Annoy index (higher=better recall, slower build)")
     spb.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Compute device for embeddings")
     spb.add_argument("--batch-size", type=int, default=64, help="Batch size for embedding computation")
+    spb.add_argument("--ngram-low", type=int, default=1, help="Min n-gram for TF-IDF")
+    spb.add_argument("--ngram-high", type=int, default=1, help="Max n-gram for TF-IDF")
+    spb.add_argument("--max-df", type=float, default=0.6, help="Max document frequency for TF-IDF vocabulary")
+    spb.add_argument("--min-df", type=int, default=10, help="Min document frequency for TF-IDF vocabulary")
+    spb.add_argument("--max-features", type=int, default=100_000, help="Max TF-IDF features")
+    spb.add_argument("--max-words", type=int, default=350, help="Max words per chunk for embeddings")
 
     sps = sub.add_parser("search", help="Search recommendations (hybrid scoring)")
     sps.add_argument("--out-dir", required=True)
@@ -318,8 +326,12 @@ def main():
     args = ap.parse_args()
     if args.cmd == "build":
         build(args.csv, args.out_dir, args.id_col, args.title_col, args.artist_col, args.lyrics_col,
-              model_name=args.model, limit_rows=args.limit_rows, index_backend=args.index_backend,
-              annoy_trees=args.annoy_trees, device=args.device, batch_size=args.batch_size)
+              model_name=args.model,
+              ngram_low=args.ngram_low, ngram_high=args.ngram_high, max_df=args.max_df,
+              min_df=args.min_df, max_features=args.max_features,
+              batch_size=args.batch_size, max_words=args.max_words, device=args.device,
+              limit_rows=args.limit_rows, index_backend=args.index_backend,
+              annoy_trees=args.annoy_trees)
     elif args.cmd == "search":
         if args.mode == "by-song":
             idxs, h, es, ts, meta, row = hybrid_search_by_song(
